@@ -1,7 +1,7 @@
 /* ============================================================
    Self-Balancing Robot  —  ESP32 + MPU6050 + TB6612FNG
    FreeRTOS version: 3 tasks, mutex-protected shared state.
-   + Drive control (WiFi), battery / RSSI telemetry, gyro calibration.
+   + Drive control (WiFi) and battery / RSSI telemetry.
    ------------------------------------------------------------
    RTOS DESIGN
      controlTask  : core 1, prio 3, fixed 200 Hz (vTaskDelayUntil)
@@ -10,18 +10,13 @@
      distanceTask : core 0, prio 1, 10 Hz. HC-SR04 (blocking pulseIn).
      Shared state guarded by a mutex (stMutex).
 
+   DRIVE: web D-pad leans the setpoint (fwd/back) and adds a
+          differential to the wheels (left/right). The robot keeps
+          balancing while it drives.
+
    BATTERY: divider on GPIO35 -> 100k (batt+ to pin) + 47k (pin to GND).
-            If you use different resistors, set BATT_DIV = R2/(R1+R2).
 
    LIBRARIES: ESP32Async/ESPAsyncWebServer + ESP32Async/AsyncTCP
-   ------------------------------------------------------------
-   REV NOTES (fixes applied):
-     [1] PID anti-windup: integral clamp now scales with Ki so
-         Ki*integral can never exceed the +/-255 output range.
-     [2] MPU reads: high/low byte order is now explicitly sequenced
-         (was relying on unspecified evaluation order of |).
-     [3] Steering now respects motorDir: dir is applied to the final
-         per-wheel command, so flipping motorDir flips turning too.
    ============================================================ */
 
 #include <Arduino.h>
@@ -59,9 +54,12 @@ const int PWM_RES  = 8;
 const float FALL_LIMIT = 45.0;
 const float ARM_WINDOW = 3.0;
 const float CTRL_DT    = 0.005;          // 200 Hz control period (s)
-const float DRIVE_TILT = 3.0;            // deg of setpoint lean per fwd/back press
+const float DRIVE_TILT = 1.5;            // deg of setpoint lean per fwd/back press (gentle = keeps balance)
+const float DRIVE_RAMP = 0.03;           // how fast the drive lean eases in (per 5 ms cycle)
 const int   STEER_PWM  = 40;             // wheel differential per left/right press
 const float BATT_DIV   = 0.319;          // R2/(R1+R2) = 47/(100+47); Vbat = Vpin/BATT_DIV
+const float OBST_NEAR  = 20.0;           // cm: start backing away below this
+const float OBST_FAR   = 30.0;           // cm: stop avoiding once clear past this
 
 // ---------------- Shared state (guarded by stMutex) ----------------
 struct State {
@@ -75,7 +73,7 @@ struct State {
   float battV;                // commsTask
   int   rssi;                 // commsTask
 };
-State st = { 20.0, 0.0, 0.8, 0.0, 40, 1, false, 0, 0, 0.0, false, -1.0, 0.0, 0 };
+State st = { 20.0, 0.0, 0.8, 0.0, 40, -1, false, 0, 0, 0.0, false, -1.0, 0.0, 0 };
 SemaphoreHandle_t stMutex;
 
 // ---------------- WiFi AP ----------------
@@ -91,34 +89,62 @@ const char PAGE[] PROGMEM = R"rawliteral(
 <!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>BalanceBot</title><style>
-body{background:#11151a;color:#e6e6e6;font-family:system-ui,sans-serif;margin:0;padding:16px;max-width:520px;margin:auto}
-h1{font-size:20px;margin:4px 0 10px}
-#stat{font-size:14px;color:#9fd;margin-bottom:8px;min-height:34px}
-canvas{width:100%;height:150px;background:#0b0e12;border-radius:10px;display:block}
+*{box-sizing:border-box}
+body{margin:0 auto;padding:20px 14px 40px;max-width:460px;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#6b3350;
+  background:linear-gradient(165deg,#fff5f9 0%,#ffe8f1 55%,#ffdbe9 100%);min-height:100vh;
+  -webkit-tap-highlight-color:transparent}
+h1{font-size:23px;font-weight:800;margin:2px 0;color:#e84a8a;text-align:center;letter-spacing:.3px}
+.sub{text-align:center;font-size:12px;color:#cf83a8;margin:2px 0 16px;letter-spacing:1px;text-transform:uppercase}
+.card{background:#fff;border:1px solid #ffd9e7;border-radius:20px;
+  box-shadow:0 8px 22px rgba(255,140,175,.18);padding:15px 16px;margin-bottom:14px}
+#stat{font-size:13px;color:#b06088;line-height:1.6;text-align:center}
+#stat b{color:#e84a8a;font-size:20px;font-weight:800}
+canvas{width:100%;height:150px;background:#fff8fb;border-radius:14px;display:block;border:1px solid #ffe1ec}
+.glabel{font-size:11px;color:#cf83a8;text-align:center;margin-top:8px;letter-spacing:1.5px;text-transform:uppercase}
+.ttl{font-size:11px;font-weight:800;color:#cf83a8;text-transform:uppercase;letter-spacing:1.5px;margin:0 0 12px;text-align:center}
 .row{margin:14px 0}
-label{display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px}
-input[type=range]{width:100%;height:30px}
-button{width:100%;padding:14px;font-size:17px;border:0;border-radius:10px;margin:6px 0;color:#fff;background:#2a7}
-button.on{background:#c33}
-#save{background:#357}
-.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:260px;margin:14px auto}
-.pad button{width:100%;padding:18px 0;font-size:22px;background:#456;margin:0;touch-action:none;user-select:none}
-.pad .sp{visibility:hidden}
+.row:first-of-type{margin-top:0}
+.row:last-of-type{margin-bottom:0}
+label{display:flex;justify-content:space-between;font-size:13px;font-weight:700;margin-bottom:9px;color:#9a4f72}
+label span{color:#ff5e9a;font-weight:800}
+input[type=range]{width:100%;height:8px;border-radius:8px;-webkit-appearance:none;appearance:none;
+  background:#ffe0ed;accent-color:#ff5e9a;outline:none;cursor:pointer}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;border-radius:50%;
+  background:#ff5e9a;border:3px solid #fff;box-shadow:0 2px 7px rgba(255,94,154,.55)}
+input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:#ff5e9a;border:3px solid #fff}
+button{width:100%;padding:15px;font-size:17px;font-weight:800;border:0;border-radius:15px;margin:0;color:#fff;
+  background:linear-gradient(135deg,#ff95bd,#ff5e9a);box-shadow:0 6px 15px rgba(255,94,154,.32);cursor:pointer;
+  -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
+  -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;transition:transform .05s,filter .15s}
+button:active{transform:translateY(1px);filter:brightness(.97)}
+#go{margin-bottom:14px;letter-spacing:1px}
+#go.on{background:linear-gradient(135deg,#ff7a92,#e8417a)}
+#save{background:#fff;color:#e84a8a;border:2px solid #ffc6dd;box-shadow:none;font-size:15px}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;max-width:230px;margin:0 auto}
+.pad button{padding:15px 0;font-size:21px;color:#d6336c;box-shadow:0 4px 11px rgba(255,140,175,.32);
+  background:linear-gradient(135deg,#ffd3e3,#ffbcd6);touch-action:none}
+.pad #bc{background:linear-gradient(135deg,#ffb0cd,#ff8fb6);color:#fff}
+.pad .sp{visibility:hidden;box-shadow:none}
 </style></head><body>
 <h1>BalanceBot</h1>
-<div id=stat>connecting…</div>
-<canvas id=g width=480 height=150></canvas>
+<div class=sub>control &amp; tuning</div>
+<div class=card><div id=stat>connecting…</div></div>
+<div class=card><canvas id=g width=480 height=150></canvas><div class=glabel>tilt angle</div></div>
 <button id=go>GO</button>
+<div class=card><div class=ttl>drive</div>
 <div class=pad>
  <div class=sp></div><button id=bf>&#9650;</button><div class=sp></div>
  <button id=bl>&#9664;</button><button id=bc>&#9632;</button><button id=br>&#9654;</button>
  <div class=sp></div><button id=bb>&#9660;</button><div class=sp></div>
-</div>
+</div></div>
+<div class=card><div class=ttl>tuning</div>
 <div class=row><label>Kp <span id=vkp></span></label><input type=range id=kp min=0 max=80 step=0.5></div>
 <div class=row><label>Ki <span id=vki></span></label><input type=range id=ki min=0 max=400 step=1></div>
 <div class=row><label>Kd <span id=vkd></span></label><input type=range id=kd min=0 max=6 step=0.05></div>
 <div class=row><label>Offset (deg) <span id=voff></span></label><input type=range id=off min=-12 max=12 step=0.1></div>
 <div class=row><label>Min PWM (deadband) <span id=vmp></span></label><input type=range id=mp min=0 max=120 step=1></div>
+</div>
 <button id=save>Save to flash</button>
 <script>
 let ws,buf=[],MAXN=240,curRun=false;
@@ -126,13 +152,13 @@ const cv=document.getElementById('g'),cx=cv.getContext('2d');
 function setS(id,v){const e=document.getElementById(id);e.value=v;document.getElementById('v'+id).textContent=(+v).toFixed(2);}
 function send(k,v){if(ws&&ws.readyState==1)ws.send(k+':'+v);}
 function draw(){const w=cv.width,h=cv.height,S=30;cx.clearRect(0,0,w,h);
- cx.strokeStyle='#2a3340';cx.lineWidth=1;cx.beginPath();cx.moveTo(0,h/2);cx.lineTo(w,h/2);cx.stroke();
- cx.strokeStyle='#39d';cx.lineWidth=2;cx.beginPath();
+ cx.strokeStyle='#f6cadb';cx.lineWidth=1;cx.beginPath();cx.moveTo(0,h/2);cx.lineTo(w,h/2);cx.stroke();
+ cx.strokeStyle='#ff4e8a';cx.lineWidth=2.5;cx.lineJoin='round';cx.beginPath();
  for(let i=0;i<buf.length;i++){const x=i/MAXN*w,y=h/2-(buf[i]/S)*(h/2);i?cx.lineTo(x,y):cx.moveTo(x,y);}cx.stroke();}
 function connect(){ws=new WebSocket('ws://'+location.host+'/ws');
  ws.onmessage=e=>{const d=e.data;
   if(d[0]=='s'){const p=d.split(';'),a=parseFloat(p[1]);curRun=p[2]=='1';const armed=p[3]=='1';
-   document.getElementById('stat').innerHTML='angle '+a.toFixed(1)+'\u00B0 &nbsp; '+(curRun?(armed?'BALANCING':'waiting upright'):'STOPPED')+'<br>dist '+p[4]+'cm &nbsp; batt '+p[5]+'V &nbsp; rssi '+p[6]+'dBm';
+   document.getElementById('stat').innerHTML='<b>'+a.toFixed(1)+'\u00B0</b><br>'+(curRun?(armed?'BALANCING':'waiting upright'):'STOPPED')+'<br>dist '+p[4]+'cm &nbsp;&middot;&nbsp; batt '+p[5]+'V &nbsp;&middot;&nbsp; rssi '+p[6]+'dBm';
    buf.push(a);if(buf.length>MAXN)buf.shift();draw();
    const go=document.getElementById('go');go.textContent=curRun?'STOP':'GO';go.className=curRun?'on':'';}
   else if(d[0]=='c'){const p=d.split(';');setS('kp',p[1]);setS('ki',p[2]);setS('kd',p[3]);setS('off',p[4]);setS('mp',p[5]);}};
@@ -162,19 +188,12 @@ void mpuInit(){
   mpuWrite(0x6B,0x00); delay(100);
   mpuWrite(0x1A,0x03); mpuWrite(0x1B,0x00); mpuWrite(0x1C,0x00);
 }
-// [FIX 2] explicit byte order: read high, then low, then combine.
-//         Avoids the unspecified evaluation order of (Wire.read()<<8)|Wire.read().
-static inline int16_t mpuRead16(){
-  uint8_t h = Wire.read();
-  uint8_t l = Wire.read();
-  return (int16_t)((h << 8) | l);
-}
 void mpuRead(int16_t &ax,int16_t &ay,int16_t &az,int16_t &gx,int16_t &gy,int16_t &gz){
   Wire.beginTransmission(MPU_ADDR); Wire.write(0x3B); Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR,14,true);
-  ax=mpuRead16(); ay=mpuRead16(); az=mpuRead16();
-  Wire.read(); Wire.read();                 // skip temperature (2 bytes)
-  gx=mpuRead16(); gy=mpuRead16(); gz=mpuRead16();
+  ax=(Wire.read()<<8)|Wire.read(); ay=(Wire.read()<<8)|Wire.read(); az=(Wire.read()<<8)|Wire.read();
+  Wire.read(); Wire.read();
+  gx=(Wire.read()<<8)|Wire.read(); gy=(Wire.read()<<8)|Wire.read(); gz=(Wire.read()<<8)|Wire.read();
 }
 
 // ============================================================
@@ -234,8 +253,12 @@ void savePrefs(){
 //  Telemetry helpers
 // ============================================================
 float readBattery(){
-  float vpin = analogReadMilliVolts(BATT_PIN) / 1000.0f;
-  return vpin / BATT_DIV;
+  uint32_t sum=0; const int N=32;
+  for(int i=0;i<N;i++) sum += analogReadMilliVolts(BATT_PIN);  // oversample
+  float vbat = ((sum/(float)N)/1000.0f) / BATT_DIV;
+  static float filt = -1;
+  filt = (filt < 0) ? vbat : (filt*0.9f + vbat*0.1f);          // EMA smoothing
+  return filt;
 }
 int apRssi(){                       // RSSI of first connected station (we are the AP)
   wifi_sta_list_t sl;
@@ -308,13 +331,25 @@ void controlTask(void *pv){
     angle = 0.98f*(angle + gyroRate*CTRL_DT) + 0.02f*accAngle;
 
     // snapshot params + drive commands
-    float Kp,Ki,Kd,offset; int minPwm,dir,fb,lr; bool run;
+    float Kp,Ki,Kd,offset; int minPwm,dir,fb,lr; bool run; float dist;
     xSemaphoreTake(stMutex,portMAX_DELAY);
     Kp=st.Kp; Ki=st.Ki; Kd=st.Kd; offset=st.offset;
     minPwm=st.minPwm; dir=st.motorDir; run=st.run; fb=st.fb; lr=st.lr;
+    dist=st.distanceCm;
     xSemaphoreGive(stMutex);
 
-    float target = offset + fb*DRIVE_TILT;   // lean the setpoint to drive fwd/back
+    // obstacle avoidance: back away from anything close ahead, overriding the
+    // radio command. Hysteresis (NEAR/FAR) stops it chattering at the edge.
+    static bool avoiding=false;
+    if(dist>0 && dist<OBST_NEAR)       avoiding=true;
+    else if(dist<0 || dist>OBST_FAR)   avoiding=false;
+    if(avoiding) fb=-dir;                 // lean back -> drive away from obstacle
+
+    // ease the drive lean in/out so fwd/back accelerates gently and keeps balance
+    static float driveBias=0;
+    driveBias += (fb*DRIVE_TILT - driveBias) * DRIVE_RAMP;
+
+    float target = offset + driveBias;   // gentle lean to drive fwd/back
 
     if(!run){
       armed=false; integral=0; motorsEnable(false); motorA(0); motorB(0);
@@ -326,19 +361,15 @@ void controlTask(void *pv){
 
     if(run && armed){
       float error=target-angle;
-      integral+=error*CTRL_DT;
-      // [FIX 1] anti-windup: clamp so Ki*integral can't exceed the +/-255 output
-      float iLimit = (Ki>0.01f) ? 255.0f/Ki : 200.0f;
-      integral=constrain(integral,-iLimit,iLimit);
+      integral+=error*CTRL_DT; integral=constrain(integral,-200,200);
       float output=Kp*error + Ki*integral - Kd*gyroRate;
       output=constrain(output,-255,255);
       int drive=(int)output;
       if(drive>1) drive+=minPwm; else if(drive<-1) drive-=minPwm;
-      drive=constrain(drive,-255,255);        // base balance command; dir applied below
+      drive=constrain(drive,-255,255)*dir;
       int steer=lr*STEER_PWM;                 // differential for turning
-      // [FIX 3] apply motorDir to the final per-wheel command so turning flips with it
-      int left =constrain(drive+steer,-255,255)*dir;
-      int right=constrain(drive-steer,-255,255)*dir;
+      int left =constrain(drive+steer,-255,255);
+      int right=constrain(drive-steer,-255,255);
       motorA(left); motorB(right);
     } else if(run){
       motorA(0); motorB(0);
